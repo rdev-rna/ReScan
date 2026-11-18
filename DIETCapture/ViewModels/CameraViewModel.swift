@@ -158,6 +158,32 @@ final class CameraViewModel {
         }
     }
     
+    // MARK: - Motion Capture
+
+    /// Locks a fast shutter (ISO picked to keep today's brightness), focus and white balance, and
+    /// mirrors them in the controls. `completion` gets the lock that was applied.
+    func applyMotionLock(shutterDenominator: Int, completion: ((CameraService.MotionLock) -> Void)? = nil) {
+        let shutter = CMTimeMake(value: 1, timescale: Int32(shutterDenominator))
+        cameraService.lockForMotion(shutter: shutter) { [weak self] lock in
+            guard let self else { return }
+            settings.exposureMode = .manual
+            settings.shutterSpeed = lock.shutter
+            settings.iso = lock.iso
+            selectedShutterPreset = ShutterSpeedPreset.presets.first { $0.label == "1/\(shutterDenominator)" }
+            if let lens = lock.lensPosition {
+                settings.focusMode = .manual
+                settings.manualFocusPosition = lens
+            }
+            if let wb = lock.whiteBalance {
+                settings.whiteBalanceMode = .manual
+                settings.whiteBalance.temperature = WhiteBalanceValues.temperatureRange.clamp(wb.temperature)
+                settings.whiteBalance.tint = WhiteBalanceValues.tintRange.clamp(wb.tint)
+            }
+            syncSliderValuesFromSettings()
+            completion?(lock)
+        }
+    }
+
     // MARK: - Apply Defaults
     
     private func applyCurrentSettings() {

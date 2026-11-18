@@ -35,8 +35,9 @@ final class ExportService {
     
     // MARK: - Odometry CSV
     
-    private var odometryFileHandle: FileHandle?
-    private var hasWrittenOdometryHeader = false
+    private var odometryWriter: CSVFileWriter?
+    private var odometryConvention: AppSettings.OdometryConvention = .opencv
+    private var frameLogWriter: CSVFileWriter?
     
     // MARK: - Device Capability Check
     
@@ -155,21 +156,25 @@ final class ExportService {
         isWritingVideo = true
     }
     
-    func appendVideoFrame(_ pixelBuffer: CVPixelBuffer, timestamp: TimeInterval) {
+    /// Appends one frame. Returns false when the frame was not written (the encoder was busy or failed),
+    /// so the caller can skip that frame's depth and pose and keep every file in step with the video.
+    @discardableResult
+    func appendVideoFrame(_ pixelBuffer: CVPixelBuffer, timestamp: TimeInterval) -> Bool {
         guard isWritingVideo, let writer = assetWriter, let input = videoInput,
-              let adaptor = pixelBufferAdaptor else { return }
-        
-        let presentationTime = CMTimeMakeWithSeconds(timestamp, preferredTimescale: 600)
-        
+              let adaptor = pixelBufferAdaptor else { return false }
+
+        // Microsecond timescale: 600 rounds 60 fps frame times unevenly
+        let presentationTime = CMTimeMakeWithSeconds(timestamp, preferredTimescale: 1_000_000)
+
         if videoStartTime == nil {
             videoStartTime = presentationTime
             writer.startSession(atSourceTime: presentationTime)
         }
-        
-        guard input.isReadyForMoreMediaData else { return }
-        
+
+        guard input.isReadyForMoreMediaData else { return false }
+
         // Write raw ARKit buffer directly (already correct orientation)
-        adaptor.append(pixelBuffer, withPresentationTime: presentationTime)
+        return adaptor.append(pixelBuffer, withPresentationTime: presentationTime)
     }
     
     func finishVideoRecording(completion: @escaping () -> Void) {
@@ -205,34 +210,58 @@ final class ExportService {
     
     // MARK: - Odometry CSV (Stray Scanner format)
     
-    func openOdometryFile(at url: URL) {
-        FileManager.default.createFile(atPath: url.path, contents: nil)
-        odometryFileHandle = try? FileHandle(forWritingTo: url)
-        hasWrittenOdometryHeader = false
-        
-        // Write header
-        let header = "timestamp, frame, x, y, z, qx, qy, qz, qw\n"
-        odometryFileHandle?.write(header.data(using: .utf8)!)
-        hasWrittenOdometryHeader = true
+    /// Same columns as Stray Scanner. The distortion columns stay empty: ARKit frames carry no
+    /// lens calibration (Stray leaves them empty in that case too).
+    func openOdometryFile(at url: URL, convention: AppSettings.OdometryConvention) {
+        odometryConvention = convention
+        odometryWriter = CSVFileWriter(
+            url: url,
+            header: "timestamp, frame, x, y, z, qx, qy, qz, qw, fx, fy, cx, cy, distortion_center_x, distortion_center_y"
+        )
     }
-    
-    func appendOdometry(timestamp: Double, frame: Int, pose: simd_float4x4) {
-        guard let handle = odometryFileHandle else { return }
-        
-        // Extract position (translation from 4x4 matrix)
-        let position = pose.position
-        
-        // Extract quaternion from rotation matrix
-        let quat = simd_quatf(pose.rotation3x3)
-        
-        let line = "\(timestamp), \(frame), \(position.x), \(position.y), \(position.z), \(quat.vector.x), \(quat.vector.y), \(quat.vector.z), \(quat.vector.w)\n"
-        handle.write(line.data(using: .utf8)!)
+
+    /// One row per saved frame. Position and the world frame are ARKit's (metres, y up against gravity).
+    /// With the OpenCV convention the camera's axes are turned 180° about x, as Stray Scanner does
+    /// (camera x right, y down, z forward); with ARKit's they are written as ARKit gives them
+    /// (x right, y up, z back).
+    func appendOdometry(timestamp: Double, frame: Int, pose: simd_float4x4, intrinsics: simd_float3x3) {
+        guard let writer = odometryWriter else { return }
+        let p = pose.position
+        var q = simd_quatf(pose.rotation3x3)
+        if odometryConvention == .opencv {
+            q = q * Self.arkitToOpenCV
+        }
+        let k = intrinsics.columns
+        let name = String(format: "%06d", frame)
+        writer.write("\(timestamp), \(name), \(p.x), \(p.y), \(p.z), \(q.vector.x), \(q.vector.y), \(q.vector.z), \(q.vector.w), \(k.0.x), \(k.1.y), \(k.2.x), \(k.2.y), , ")
     }
-    
+
     func closeOdometryFile() {
-        odometryFileHandle?.closeFile()
-        odometryFileHandle = nil
-        hasWrittenOdometryHeader = false
+        odometryWriter?.close()
+        odometryWriter = nil
+    }
+
+    /// 180° about the camera's x axis (Stray Scanner's q_AC).
+    private static let arkitToOpenCV = simd_quatf(ix: 1, iy: 0, iz: 0, r: 0)
+
+    // MARK: - Per-frame camera state (frames.csv)
+
+    func openFrameLog(at url: URL) {
+        frameLogWriter = CSVFileWriter(
+            url: url,
+            header: "timestamp, frame, exposure_duration, exposure_offset, iso, lens_position, wb_red_gain, wb_green_gain, wb_blue_gain, tracking_state"
+        )
+    }
+
+    func appendFrameLog(_ m: CaptureFrameMetadata, exposureOffset: Float, whiteBalanceGains: (Float, Float, Float)) {
+        let name = String(format: "%06d", m.frameIndex)
+        let wb = whiteBalanceGains
+        frameLogWriter?.write("\(m.timestamp), \(name), \(m.exposureDuration), \(exposureOffset), \(m.iso), \(m.lensPosition), \(wb.0), \(wb.1), \(wb.2), \(m.trackingState)")
+    }
+
+    func closeFrameLog() {
+        frameLogWriter?.close()
+        frameLogWriter = nil
     }
     
     // MARK: - Depth Map Export (16-bit PNG, millimeters)
@@ -431,15 +460,11 @@ final class ExportService {
             }
             let pointer = baseAddress.assumingMemoryBound(to: UInt8.self)
             
-            // Scale 0,1,2 → 0, 127, 255
+            // ARKit's levels as they are: 0 = low, 1 = medium, 2 = high (the Stray Scanner format).
+            // The library preview stretches them for display.
             var scaledData = [UInt8](repeating: 0, count: width * height)
             for i in 0..<(width * height) {
-                switch pointer[i] {
-                case 0: scaledData[i] = 0
-                case 1: scaledData[i] = 127
-                case 2: scaledData[i] = 255
-                default: scaledData[i] = 0
-                }
+                scaledData[i] = min(pointer[i], 2)
             }
             
             scaledData.withUnsafeMutableBytes { rawBuffer in

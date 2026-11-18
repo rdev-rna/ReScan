@@ -18,6 +18,7 @@ struct SettingsView: View {
     
     private enum SettingsSection: String, CaseIterable {
         case capture = "Capture"
+        case motion = "Motion Capture"
         case lidar = "LiDAR"
         case encoding = "Encoding"
         case storage = "Storage"
@@ -33,6 +34,7 @@ struct SettingsView: View {
                 ScrollView {
                     VStack(spacing: 16) {
                         captureSection
+                        motionSection
                         lidarSection
                         encodingSection
                         storageSection
@@ -125,7 +127,9 @@ struct SettingsView: View {
                         .pickerStyle(.menu)
                         .tint(.cyan)
                     }
-                    Text("Frames saved per second. ARKit runs at 30fps internally for tracking. Lower FPS = smaller files.")
+                    Text(settings.motionCaptureMode
+                         ? "Motion Capture mode is on: every frame is saved at 60 fps and this setting is ignored."
+                         : "Frames saved per second. ARKit runs at 30fps internally for tracking. Lower FPS = smaller files.")
                         .font(.caption2)
                         .foregroundStyle(.secondary.opacity(0.6))
                 }
@@ -133,6 +137,114 @@ struct SettingsView: View {
         }
     }
     
+    // MARK: - Motion Capture Section
+
+    private var motionSection: some View {
+        settingsCard(
+            section: .motion,
+            icon: "figure.run",
+            iconColor: .orange,
+            title: "Motion Capture",
+            subtitle: settings.motionCaptureMode
+                ? "On · 60 fps · 1/\(settings.motionShutterDenominator) s"
+                : "Off"
+        ) {
+            VStack(spacing: 14) {
+                HStack {
+                    Image(systemName: "figure.run")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(width: 20)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Motion Capture Mode")
+                            .font(.subheadline)
+                            .foregroundStyle(.white)
+                        Text("60 fps, every frame kept, no scene mesh, floor detection. When recording starts, the shutter is fixed (ISO keeps the current brightness) and focus and white balance lock.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary.opacity(0.6))
+                    }
+                    Spacer()
+                    Toggle("", isOn: $settings.motionCaptureMode)
+                        .tint(.orange)
+                        .labelsHidden()
+                }
+
+                if settings.motionCaptureMode {
+                    rowDivider
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Image(systemName: "camera.aperture")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .frame(width: 20)
+                            Text("Shutter")
+                                .font(.subheadline)
+                                .foregroundStyle(.white)
+                            Spacer()
+                            Picker("", selection: $settings.motionShutterDenominator) {
+                                ForEach(AppSettings.motionShutterOptions, id: \.self) { n in
+                                    Text("1/\(n) s").tag(n)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .tint(.orange)
+                        }
+                        Text("Faster freezes hands and feet but needs more light. 1/500 suits most moves; 1/1000 for sword swings in bright light.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary.opacity(0.6))
+                    }
+                }
+
+                rowDivider
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Image(systemName: "move.3d")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .frame(width: 20)
+                        Text("Pose Axes")
+                            .font(.subheadline)
+                            .foregroundStyle(.white)
+                        Spacer()
+                        Picker("", selection: $settings.odometryConvention) {
+                            ForEach(AppSettings.OdometryConvention.allCases) { c in
+                                Text(c.rawValue).tag(c)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .tint(.orange)
+                    }
+                    Text("Camera axes in odometry.csv. OpenCV matches Stray Scanner (and BlendCap's LiDAR step). ARKit is what ReScan 1.2 wrote.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary.opacity(0.6))
+                }
+
+                rowDivider
+
+                HStack {
+                    Image(systemName: "gyroscope")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(width: 20)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Record IMU")
+                            .font(.subheadline)
+                            .foregroundStyle(.white)
+                        Text("Accelerometer and gyroscope at 200 Hz to imu.csv.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary.opacity(0.6))
+                    }
+                    Spacer()
+                    Toggle("", isOn: $settings.recordIMU)
+                        .tint(.orange)
+                        .labelsHidden()
+                }
+            }
+        }
+    }
+
     private var availableResolutions: [AppSettings.VideoResolution] {
         if settings.lidarEnabled {
             return [.high]
@@ -695,9 +807,14 @@ struct SettingsView: View {
                     Text("• rgb/ (EXR — via Library)").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
                     Text("• camera_matrix.csv").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
                     Text("• odometry.csv").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
+                    Text("• frames.csv (per-frame exposure, ISO, focus, WB)").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
+                    if settings.recordIMU {
+                        Text("• imu.csv").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
+                    }
+                    Text("• rescan.json (take info, floor plane)").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
                     if settings.lidarEnabled {
                         Text("• depth/ (16-bit PNG mm)").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
-                        Text("• confidence/ (8-bit PNG)").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
+                        Text("• confidence/ (8-bit PNG, 0/1/2)").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
                         Text("• mesh.obj").font(.caption2).foregroundStyle(.secondary.opacity(0.7))
                     }
                 }

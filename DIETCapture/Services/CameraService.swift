@@ -108,8 +108,80 @@ final class CameraService: NSObject {
         return CMTimeMakeWithSeconds(clamped, preferredTimescale: 1000000)
     }
     
+    // MARK: - Motion Capture Lock
+
+    struct MotionLock {
+        let shutter: CMTime
+        let iso: Float
+        /// True when the ISO needed to keep the brightness was above the camera's maximum.
+        let isoClipped: Bool
+        let lensPosition: Float?
+        let whiteBalance: AVCaptureDevice.WhiteBalanceTemperatureAndTintValues?
+    }
+
+    /// Fixes the shutter at `shutter`, picking the ISO that keeps the picture as bright as it is now,
+    /// and locks focus and white balance where they are. `completion` runs on the main thread.
+    func lockForMotion(shutter: CMTime, completion: @escaping (MotionLock) -> Void) {
+        guard let device = currentDevice else { return }
+        controlQueue.async {
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                let format = device.activeFormat
+                let duration = self.clampShutterSpeed(shutter, device: device)
+                // Brightness ~ exposure time x ISO: keep the product the camera has metered
+                let metered = CMTimeGetSeconds(device.exposureDuration) * Double(device.iso)
+                let wanted = Float(metered / max(CMTimeGetSeconds(duration), 1e-6))
+                let iso = max(format.minISO, min(wanted, format.maxISO))
+                device.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
+
+                var lens: Float?
+                if device.isLockingFocusWithCustomLensPositionSupported {
+                    lens = device.lensPosition
+                    device.setFocusModeLocked(lensPosition: device.lensPosition, completionHandler: nil)
+                } else if device.isFocusModeSupported(.locked) {
+                    device.focusMode = .locked
+                }
+
+                var wb: AVCaptureDevice.WhiteBalanceTemperatureAndTintValues?
+                if device.isWhiteBalanceModeSupported(.locked) {
+                    let gains = device.deviceWhiteBalanceGains
+                    wb = device.temperatureAndTintValues(for: gains)
+                    device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+                }
+
+                let lock = MotionLock(shutter: duration, iso: iso, isoClipped: wanted > format.maxISO * 1.05,
+                                      lensPosition: lens, whiteBalance: wb)
+                DispatchQueue.main.async {
+                    self.currentISO = iso
+                    self.currentShutterSpeed = duration
+                    if let lens { self.currentFocusPosition = lens }
+                    completion(lock)
+                }
+            } catch {
+                print("[CameraService] Motion lock error: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Live Values (per frame)
+
+    struct LiveValues {
+        let iso: Float
+        let lensPosition: Float
+        let whiteBalanceGains: (Float, Float, Float)
+    }
+
+    /// What the camera is actually using right now (not what the controls were set to).
+    func liveValues() -> LiveValues? {
+        guard let device = currentDevice else { return nil }
+        let g = device.deviceWhiteBalanceGains
+        return LiveValues(iso: device.iso, lensPosition: device.lensPosition,
+                          whiteBalanceGains: (g.redGain, g.greenGain, g.blueGain))
+    }
+
     // MARK: - Focus
-    
+
     func setFocusMode(_ mode: FocusMode, lensPosition: Float? = nil) {
         guard let device = currentDevice else { return }
         controlQueue.async {

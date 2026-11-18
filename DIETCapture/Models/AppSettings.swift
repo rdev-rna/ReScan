@@ -44,6 +44,36 @@ final class AppSettings: ObservableObject {
     /// HDR video capture
     @AppStorage("enableHDR") var enableHDR: Bool = true
     
+    // MARK: - Motion Capture
+
+    /// Motion capture mode: ARKit at 60 fps with every frame kept, no scene mesh, floor detection,
+    /// and a fast shutter locked (with focus and white balance) when recording starts.
+    @AppStorage("motionCaptureMode") var motionCaptureMode: Bool = false
+
+    /// Shutter used in motion capture mode: 1/N second.
+    @AppStorage("motionShutterDenominator") var motionShutterDenominator: Int = 500
+    static let motionShutterOptions: [Int] = [250, 500, 1000, 2000]
+
+    /// Camera axes written to odometry.csv. OpenCV matches Stray Scanner (x right, y down, z forward).
+    @AppStorage("odometryConvention") var odometryConvention: OdometryConvention = .opencv
+
+    /// Record raw accelerometer + gyroscope to imu.csv.
+    @AppStorage("recordIMU") var recordIMU: Bool = true
+
+    enum OdometryConvention: String, CaseIterable, Identifiable {
+        case opencv = "OpenCV (Stray Scanner)"
+        case arkit = "ARKit (ReScan 1.2)"
+        var id: String { rawValue }
+
+        /// Short name written to rescan.json.
+        var key: String {
+            switch self {
+            case .opencv: return "opencv"
+            case .arkit: return "arkit"
+            }
+        }
+    }
+
     // MARK: - External Storage
     
     @Published var hasExternalStorage: Bool = false

@@ -8,6 +8,7 @@ import Foundation
 import AVFoundation
 import ARKit
 import Combine
+import UIKit
 
 @Observable
 final class CaptureViewModel {
@@ -57,6 +58,15 @@ final class CaptureViewModel {
     
     // Intrinsics saved flag
     private var intrinsicsSaved = false
+
+    // Index of the next saved frame. Kept here (not session.frameCount, which is bumped later on the
+    // main queue) so every frame gets its own index, and advanced only when the video took the frame.
+    private var nextFrameIndex = 0
+    private var droppedFrames = 0
+    private var videoSize: (width: Int, height: Int)?
+    private var motionLock: CameraService.MotionLock?
+    private var imuRecording = false
+    private let imuRecorder = IMURecorder()
     
     // FPS subsampling
     private var lastCaptureTimestamp: TimeInterval = -1
@@ -132,23 +142,25 @@ final class CaptureViewModel {
             
             // Set capture FPS interval
             let appSettings = AppSettings.shared
-            captureInterval = appSettings.captureFPS.captureInterval
+            let motionMode = appSettings.motionCaptureMode
+            // Motion capture keeps every frame ARKit delivers
+            captureInterval = motionMode ? 0 : appSettings.captureFPS.captureInterval
             lastCaptureTimestamp = -1
-            
+
             // Pass LiDAR state to session so it can skip depth/confidence directories
             session.lidarEnabled = appSettings.lidarEnabled
-            
+
             _ = try session.createSessionDirectory()
-            
-            // Initialize adaptive mesh refinement if enabled (only with LiDAR)
-            if appSettings.adaptiveMeshRefinement && appSettings.lidarEnabled {
+
+            // Initialize adaptive mesh refinement if enabled (only with LiDAR and a scene mesh)
+            if appSettings.adaptiveMeshRefinement && appSettings.lidarEnabled && !motionMode {
                 meshRefinement = AdaptiveMeshRefinement(detailLevel: appSettings.meshDetailLevel)
             } else {
                 meshRefinement = nil
             }
-            
-            if !appSettings.lidarEnabled || appSettings.meshStartMode == .bruteForce {
-                // Start immediately when LiDAR is disabled (no mesh to wait for)
+
+            if !appSettings.lidarEnabled || motionMode || appSettings.meshStartMode == .bruteForce {
+                // Start immediately when there is no mesh to wait for
                 beginCapture()
             } else {
                 // WaitForPolygons: defer actual start until first mesh anchors arrive
@@ -166,10 +178,31 @@ final class CaptureViewModel {
         isWaitingForMesh = false
         session.startRecording()
         intrinsicsSaved = false
-        
-        // Open odometry CSV
+        nextFrameIndex = 0
+        droppedFrames = 0
+        videoSize = nil
+        motionLock = nil
+
+        let settings = AppSettings.shared
+
+        // Open odometry CSV, the per-frame camera log and the IMU log
         if let odometryURL = session.odometryURL {
-            exportService.openOdometryFile(at: odometryURL)
+            exportService.openOdometryFile(at: odometryURL, convention: settings.odometryConvention)
+        }
+        if let dir = session.sessionDirectory {
+            exportService.openFrameLog(at: dir.appendingPathComponent("frames.csv"))
+            imuRecording = settings.recordIMU && imuRecorder.start(url: dir.appendingPathComponent("imu.csv"))
+        }
+
+        // Motion capture: fast shutter, focus and white balance locked as the take starts
+        if settings.motionCaptureMode {
+            let denominator = settings.motionShutterDenominator
+            camera.applyMotionLock(shutterDenominator: denominator) { [weak self] lock in
+                self?.motionLock = lock
+                if lock.isoClipped {
+                    self?.showError(message: "⚠️ Too dark for 1/\(denominator) s: ISO is at its maximum, so the video will be darker. Add light or pick a slower shutter.")
+                }
+            }
         }
         
         // Start timer
@@ -207,9 +240,16 @@ final class CaptureViewModel {
         recordingTimer?.invalidate()
         recordingTimer = nil
         
-        // Close odometry
+        // Close odometry, the camera log and the IMU log
         exportService.closeOdometryFile()
-        
+        exportService.closeFrameLog()
+        if imuRecording {
+            imuRecorder.stop()
+        }
+
+        // Take metadata and the floor plane
+        writeTakeInfo(anchors: lidar.arService.currentFrame?.anchors ?? [])
+
         // Export mesh if available
         let meshAnchors = lidar.meshAnchors
         if !meshAnchors.isEmpty, let meshURL = session.meshURL {
@@ -259,8 +299,8 @@ final class CaptureViewModel {
             }
         }
         lastCaptureTimestamp = timestamp
-        
-        let frameIndex = session.frameCount
+
+        let frameIndex = nextFrameIndex
         let pose = frame.camera.transform
         let intrinsics = frame.camera.intrinsics
         let capturedImage = frame.capturedImage
@@ -275,6 +315,7 @@ final class CaptureViewModel {
             // Start video writer with actual frame dimensions
             let width = CVPixelBufferGetWidth(capturedImage)
             let height = CVPixelBufferGetHeight(capturedImage)
+            videoSize = (width, height)
             if let videoURL = session.videoURL {
                 do {
                     try exportService.startVideoRecording(
@@ -289,11 +330,16 @@ final class CaptureViewModel {
             }
         }
         
-        // Append video frame
-        exportService.appendVideoFrame(capturedImage, timestamp: timestamp)
-        
-        // Append odometry
-        exportService.appendOdometry(timestamp: timestamp, frame: frameIndex, pose: pose)
+        // Append video frame. If the encoder did not take it, drop the whole frame (pose, depth,
+        // confidence) so video frame N, odometry row N and depth/N.png stay the same moment.
+        guard exportService.appendVideoFrame(capturedImage, timestamp: timestamp) else {
+            droppedFrames += 1
+            return
+        }
+        nextFrameIndex += 1
+
+        // Append odometry (pose + this frame's intrinsics)
+        exportService.appendOdometry(timestamp: timestamp, frame: frameIndex, pose: pose, intrinsics: intrinsics)
         
         // Record mesh observations for adaptive refinement
         if let refinement = meshRefinement {
@@ -319,17 +365,24 @@ final class CaptureViewModel {
             }
         }()
         
+        // What the camera actually used for this frame (auto modes change it frame to frame)
+        let live = camera.cameraService.liveValues()
         let metadata = CaptureFrameMetadata(
             frameIndex: frameIndex,
             timestamp: timestamp,
             cameraPose: pose.flatArray,
             cameraIntrinsics: intrinsics.flatArray,
-            exposureDuration: CMTimeGetSeconds(camera.settings.shutterSpeed),
-            iso: camera.settings.iso,
-            lensPosition: camera.settings.manualFocusPosition,
+            exposureDuration: frame.camera.exposureDuration,
+            iso: live?.iso ?? camera.settings.iso,
+            lensPosition: live?.lensPosition ?? camera.settings.manualFocusPosition,
             trackingState: trackingState
         )
-        
+        exportService.appendFrameLog(
+            metadata,
+            exposureOffset: frame.camera.exposureOffset,
+            whiteBalanceGains: live?.whiteBalanceGains ?? (0, 0, 0)
+        )
+
         DispatchQueue.main.async {
             self.session.addFrame(metadata: metadata)
         }
@@ -365,6 +418,112 @@ final class CaptureViewModel {
         }
     }
     
+    // MARK: - Take Info (rescan.json)
+
+    /// Writes rescan.json: what this take holds and how to read it, plus the floor plane ARKit found
+    /// (motion capture mode detects horizontal planes). Older readers ignore the file.
+    private func writeTakeInfo(anchors: [ARAnchor]) {
+        guard let dir = session.sessionDirectory else { return }
+        let settings = AppSettings.shared
+        let format = lidar.arService.activeVideoFormat
+        let sensorFPS = format?.framesPerSecond ?? 30
+        let savedFPS = settings.motionCaptureMode ? sensorFPS : min(settings.captureFPS.rawValue, sensorFPS)
+
+        var machine = utsname()
+        uname(&machine)
+        let model = withUnsafePointer(to: &machine.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+        }
+
+        var info: [String: Any] = [
+            "format": "stray_scanner",
+            "format_version": 1,
+            "app": "ReScan",
+            "app_version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+            "device": model,
+            "os_version": UIDevice.current.systemVersion,
+            "created": ISO8601DateFormatter().string(from: session.startTime ?? Date()),
+            "motion_capture_mode": settings.motionCaptureMode,
+            "frames": nextFrameIndex,
+            "dropped_frames": droppedFrames,
+            "fps": savedFPS,
+            "sensor_fps": sensorFPS,
+            "odometry": [
+                "camera_convention": settings.odometryConvention.key,
+                "camera_axes": settings.odometryConvention == .opencv
+                    ? "x right, y down, z forward" : "x right, y up, z back",
+                "world": "ARKit, gravity aligned: y up, metres",
+                "pose": "camera to world"
+            ] as [String: Any],
+            "confidence_levels": [0, 1, 2],
+        ]
+        if let size = videoSize {
+            info["video"] = [
+                "file": session.videoURL?.lastPathComponent ?? "",
+                "width": size.width,
+                "height": size.height,
+                "encoding": activeEncodingMode.label
+            ] as [String: Any]
+        }
+        if settings.lidarEnabled {
+            info["depth"] = ["units": "millimetres", "format": "16-bit PNG",
+                             "max_distance_m": Double(self.settings.lidar.maxDistance)] as [String: Any]
+        }
+        if imuRecording {
+            info["imu"] = ["file": "imu.csv", "accelerometer": "m/s^2, includes gravity", "gyroscope": "rad/s",
+                           "clock": "same as odometry timestamps"] as [String: Any]
+        }
+        if let lock = motionLock {
+            var camera: [String: Any] = ["shutter_s": CMTimeGetSeconds(lock.shutter), "iso": lock.iso,
+                                         "iso_at_maximum": lock.isoClipped]
+            if let lens = lock.lensPosition { camera["lens_position"] = lens }
+            if let wb = lock.whiteBalance {
+                camera["white_balance_k"] = wb.temperature
+                camera["white_balance_tint"] = wb.tint
+            }
+            info["camera_lock"] = camera
+        }
+        if let floor = Self.floorInfo(from: anchors) {
+            info["floor"] = floor
+        }
+
+        let url = dir.appendingPathComponent("rescan.json")
+        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: url)
+        }
+        if droppedFrames > 0 {
+            print("[CaptureVM] \(droppedFrames) frames dropped (encoder busy); their depth and poses were skipped too")
+        }
+    }
+
+    /// The floor in ARKit's world (y up): a plane ARKit classified as floor (the largest), else the
+    /// lowest horizontal plane bigger than 0.25 m², else the largest horizontal plane.
+    private static func floorInfo(from anchors: [ARAnchor]) -> [String: Any]? {
+        let planes = anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }
+        guard !planes.isEmpty else { return nil }
+        func area(_ p: ARPlaneAnchor) -> Float { p.planeExtent.width * p.planeExtent.height }
+        func isFloor(_ p: ARPlaneAnchor) -> Bool {
+            if case .floor = p.classification { return true }
+            return false
+        }
+        let largest = { (ps: [ARPlaneAnchor]) in ps.max(by: { area($0) < area($1) }) }
+        guard let pick = largest(planes.filter(isFloor))
+                ?? planes.filter({ area($0) > 0.25 }).min(by: { $0.transform.columns.3.y < $1.transform.columns.3.y })
+                ?? largest(planes)
+        else { return nil }
+        let c = pick.transform * SIMD4<Float>(pick.center, 1)
+        let n = simd_normalize(SIMD3<Float>(pick.transform.columns.1.x, pick.transform.columns.1.y, pick.transform.columns.1.z))
+        return [
+            "height_m": c.y,
+            "center": [c.x, c.y, c.z],
+            "normal": [n.x, n.y, n.z],
+            "extent_m": [pick.planeExtent.width, pick.planeExtent.height],
+            "classified_as_floor": isFloor(pick),
+            "horizontal_planes": planes.count,
+            "frame": "ARKit world (same as odometry positions)"
+        ]
+    }
+
     // MARK: - Thermal
     
     func checkThermalState() {

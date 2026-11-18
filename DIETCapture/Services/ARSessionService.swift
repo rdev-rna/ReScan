@@ -34,6 +34,9 @@ final class ARSessionService: NSObject {
     
     // Mesh
     var meshAnchors: [ARMeshAnchor] = []
+
+    /// The video format the session is running with.
+    private(set) var activeVideoFormat: ARConfiguration.VideoFormat?
     
     // Settings
     var maxDistance: Float = 5.0
@@ -57,8 +60,13 @@ final class ARSessionService: NSObject {
         // Actual capture FPS is handled by frame subsampling in CaptureViewModel
         let formats = ARWorldTrackingConfiguration.supportedVideoFormats
         var selectedFormat: ARConfiguration.VideoFormat
-        
-        if settings.videoResolution == .fourK && !settings.lidarEnabled {
+        let motionMode = settings.motionCaptureMode
+        let area: (ARConfiguration.VideoFormat) -> CGFloat = { $0.imageResolution.width * $0.imageResolution.height }
+
+        if motionMode, let sixty = formats.filter({ $0.framesPerSecond >= 60 }).max(by: { area($0) < area($1) }) {
+            // Motion capture: the largest 60 fps format (fast limbs need the frame rate more than pixels)
+            selectedFormat = sixty
+        } else if settings.videoResolution == .fourK && !settings.lidarEnabled {
             // 4K: highest resolution available (only when LiDAR is disabled)
             selectedFormat = formats
                 .max(by: { ($0.imageResolution.width * $0.imageResolution.height) < ($1.imageResolution.width * $1.imageResolution.height) })
@@ -94,16 +102,24 @@ final class ARSessionService: NSObject {
                 config.frameSemantics.insert(.smoothedSceneDepth)
             }
             
-            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+            // The scene mesh costs GPU time that a 60 fps take needs; motion capture skips it
+            if !motionMode,
+               ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
                 config.sceneReconstruction = .meshWithClassification
             }
         }
-        
-        // Environment texturing
-        config.environmentTexturing = .automatic
-        
-        // High resolution frame capturing (only when not in 4K mode)
-        if settings.videoResolution != .fourK || settings.lidarEnabled {
+
+        // Motion capture: detect the floor (written to floor.json for grounding)
+        if motionMode {
+            config.planeDetection = [.horizontal]
+        }
+
+        // Environment texturing (not needed for motion capture)
+        config.environmentTexturing = motionMode ? .none : .automatic
+
+        // High resolution frame capturing (only when not in 4K mode). It is a 30 fps format,
+        // so motion capture keeps its 60 fps one.
+        if !motionMode && (settings.videoResolution != .fourK || settings.lidarEnabled) {
             if let hiResFormat = ARWorldTrackingConfiguration
                 .recommendedVideoFormatForHighResolutionFrameCapturing {
                 config.videoFormat = hiResFormat
@@ -112,7 +128,9 @@ final class ARSessionService: NSObject {
         
         // World alignment
         config.worldAlignment = .gravity
-        
+
+        activeVideoFormat = config.videoFormat
+        print("[ARSessionService] Running \(config.videoFormat.imageResolution) @ \(config.videoFormat.framesPerSecond)fps, motion capture: \(motionMode)")
         self.configuration = config
         arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
         isRunning = true

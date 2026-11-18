@@ -656,13 +656,36 @@ struct SessionDetailView: View {
             let confURL = session.directory.appendingPathComponent("confidence/\(frameName).png")
             if fm.fileExists(atPath: confURL.path),
                let image = UIImage(contentsOfFile: confURL.path) {
-                currentImage = image
+                currentImage = Self.visibleConfidence(image)
             } else {
                 currentImage = nil
             }
         }
     }
     
+    /// Confidence PNGs hold 0/1/2 (older ReScan takes: 0/127/255). Stretch the small levels so they show.
+    private static func visibleConfidence(_ image: UIImage) -> UIImage {
+        guard let cg = image.cgImage else { return image }
+        let w = cg.width, h = cg.height
+        var pixels = [UInt8](repeating: 0, count: w * h)
+        let drawn = pixels.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                                      bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(),
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drawn, let top = pixels.max(), top <= 2 else { return image }
+        for i in pixels.indices { pixels[i] = UInt8(min(255, Int(pixels[i]) * 127)) }
+        return pixels.withUnsafeMutableBytes { buf -> UIImage in
+            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                                      bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(),
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue),
+                  let out = ctx.makeImage() else { return image }
+            return UIImage(cgImage: out)
+        }
+    }
+
     private func setupVideoPlayer() {
         if let videoURL = session.videoURL {
             player = AVPlayer(url: videoURL)
